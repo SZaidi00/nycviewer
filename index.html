@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NYC 3D Subway Viewer</title>
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.1.2/mapbox-gl.js"></script>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.1.2/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="token-overlay" class="overlay">
+    <div class="panel">
+      <h1>NYC 3D Subway Viewer</h1>
+      <p>This app needs a free Mapbox access token to display 3D buildings and the base map.</p>
+      <ol>
+        <li>Get a free token at <a href="https://account.mapbox.com/access-tokens/" target="_blank">mapbox.com</a></li>
+        <li>Paste it below and click Load Map</li>
+      </ol>
+      <input type="text" id="token-input" placeholder="pk.eyJ1Ijoi..." />
+      <button id="load-map-btn">Load Map</button>
+      <label class="save-label">
+        <input type="checkbox" id="save-token" checked /> Save token in this browser
+      </label>
+    </div>
+  </div>
+
+  <div id="loading-overlay" class="overlay hidden">
+    <div class="panel">
+      <div class="spinner"></div>
+      <p>Loading subway data...</p>
+    </div>
+  </div>
+
+  <div id="ui-controls" class="hidden">
+    <div class="info-panel">
+      <h3>Subway Routes</h3>
+      <div id="route-legend"></div>
+      <div class="depth-key">
+        <h4>Approximate Depths</h4>
+        <div class="depth-row"><span class="dot" style="background:#888"></span> IRT (oldest) ~25m</div>
+        <div class="depth-row"><span class="dot" style="background:#888"></span> BMT ~40m</div>
+        <div class="depth-row"><span class="dot" style="background:#888"></span> IND (deepest) ~55m</div>
+      </div>
+    </div>
+    <div class="controls-panel">
+      <h3>Controls</h3>
+      <ul>
+        <li><strong>Left click + drag</strong> to rotate</li>
+        <li><strong>Right click + drag</strong> to pan</li>
+        <li><strong>Scroll</strong> to zoom</li>
+        <li><strong>Ctrl + drag</strong> to tilt/pitch</li>
+      </ul>
+      <button id="reset-view">Reset View</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
