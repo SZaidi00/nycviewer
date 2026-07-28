@@ -1,13 +1,17 @@
 # NYC 3D Subway Viewer
 
-A frontend-only web app that visualizes Manhattan in 3D — white buildings above ground and MTA subway routes below ground, all in one continuous scene.
+A frontend-only web app that visualizes Manhattan in 3D — white buildings above ground and MTA subway routes below ground — as **two worlds connected by a depth elevator**.
 
 ## What it shows
 
-- **Above ground:** Clean white 3D buildings (styled like Apple Maps' 3D view, no satellite imagery)
-- **Below ground:** MTA subway lines rendered as true 3D tubes at varying depths
-- **Stations:** Small colored spheres along each route
-- **360° navigation:** Rotate, pitch, zoom, and pan freely to see both layers from any angle
+- **Above ground (Mapbox GL):** Clean white 3D buildings on a light base map, styled like Apple Maps' 3D view
+- **Below ground (custom Three.js scene):** MTA subway lines as glowing 3D tubes at true negative depths, with distance fog, a faint street-grid plane at 0 m for reference, and a free orbit camera that can dive right into the tunnels
+- **Depth elevator:** A vertical control on the right edge — drag the knob down to descend and the city crossfades into the underground scene. Depth stops mark the real system levels (IRT ~25 m, BMT ~40 m, IND ~55 m); tap one to jump to that level and isolate its lines
+- **System isolation:** Click a system row in the legend (or a depth stop) to dim every other system to a ghost
+
+## Why two renderers
+
+The underground view is deliberately **not** a Mapbox custom layer. Mapbox GL's renderer can't reliably depth-test custom content against its own ground plane (the tubes either vanish or float on top), and its camera can't go below the street. The underground scene is a standalone Three.js world with its own canvas and camera, crossfaded in by the elevator — so depth, fog and glow all behave exactly as they should.
 
 ## Subway depth logic
 
@@ -23,9 +27,9 @@ Each line also has slight sinusoidal variation along its path so it doesn't look
 
 ## Tech stack
 
-- **Mapbox GL JS v3** — base map, navigation, and 3D building extrusions
-- **Three.js r128** — custom Mapbox layer for 3D subway tubes and station spheres
-- **NYC OpenData** — live GeoJSON for subway lines and stations (no backend required)
+- **Mapbox GL JS v3** — above-ground base map, navigation, and 3D building extrusions
+- **Three.js r128 + OrbitControls** — standalone underground scene (tubes, stations, fog, grid)
+- **NYC OpenData** — local GeoJSON for subway lines and stations (no backend required)
 
 ## Running locally
 
@@ -41,7 +45,7 @@ Then open `http://localhost:8080`.
 
 ## Mapbox token
 
-You'll need a free Mapbox access token to run this. Get one at [account.mapbox.com/access-tokens](https://account.mapbox.com/access-tokens/).
+You'll need a free Mapbox access token for the above-ground city. Get one at [account.mapbox.com/access-tokens](https://account.mapbox.com/access-tokens/).
 
 You can provide it via:
 1. The on-screen prompt (optionally saved to localStorage)
@@ -51,12 +55,14 @@ You can provide it via:
 
 | Action | Control |
 |--------|---------|
-| Rotate | Left click + drag |
+| Descend / ascend | Drag the elevator knob on the right edge |
+| Jump to a system's depth | Click a depth stop (IRT / BMT / IND) |
+| Isolate a system | Click its legend row or depth stop (click again to clear) |
+| Rotate / orbit | Left click + drag |
 | Pan | Right click + drag |
 | Zoom | Scroll |
-| Tilt / pitch | Ctrl + drag (or right-click drag on some setups) |
 
-Click **Reset View** to return to the default Manhattan vantage point.
+Click **Reset view** (bottom right) to return to the default camera for the current world.
 
 ## Notes
 

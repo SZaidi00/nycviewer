@@ -7,15 +7,22 @@
   <script src="https://api.mapbox.com/mapbox-gl-js/v3.1.2/mapbox-gl.js"></script>
   <link href="https://api.mapbox.com/mapbox-gl-js/v3.1.2/mapbox-gl.css" rel="stylesheet" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div id="map"></div>
 
+  <!-- Fully custom underground scene (Three.js), crossfaded in by the elevator -->
+  <div id="underground">
+    <canvas id="underground-canvas"></canvas>
+  </div>
+
+  <!-- Token prompt -->
   <div id="token-overlay" class="overlay">
     <div class="panel">
       <h1>NYC 3D Subway Viewer</h1>
-      <p>This app needs a free Mapbox access token to display 3D buildings and the base map.</p>
+      <p>This app needs a free Mapbox access token to display the above-ground city.</p>
       <ol>
         <li>Get a free token at <a href="https://account.mapbox.com/access-tokens/" target="_blank">mapbox.com</a></li>
         <li>Paste it below and click Load Map</li>
@@ -28,6 +35,7 @@
     </div>
   </div>
 
+  <!-- Loading -->
   <div id="loading-overlay" class="overlay hidden">
     <div class="panel">
       <div class="spinner"></div>
@@ -35,27 +43,67 @@
     </div>
   </div>
 
+  <!-- Main UI -->
   <div id="ui-controls" class="hidden">
-    <div class="info-panel">
-      <h3>Subway Routes</h3>
-      <div id="route-legend"></div>
-      <div class="depth-key">
-        <h4>Approximate Depths</h4>
-        <div class="depth-row"><span class="dot" style="background:#888"></span> IRT (oldest) ~25m</div>
-        <div class="depth-row"><span class="dot" style="background:#888"></span> BMT ~40m</div>
-        <div class="depth-row"><span class="dot" style="background:#888"></span> IND (deepest) ~55m</div>
+
+    <!-- Depth elevator: drag down to descend below the city -->
+    <div id="depth-elevator">
+      <div class="elevator-cap" id="elevator-cap">Street level</div>
+      <div id="descend-hint">
+        Pull down<br>to descend
+        <span class="hint-arrow">↓</span>
       </div>
+      <div class="elevator-track" id="elevator-track">
+        <div class="elevator-line"></div>
+        <button class="elevator-stop" data-system="IRT" data-depth="0.42" style="--d:41.7%" title="Descend to IRT level">
+          <span class="stop-dot"></span>
+          <span class="stop-label">IRT · 25 m</span>
+        </button>
+        <button class="elevator-stop" data-system="BMT" data-depth="0.67" style="--d:66.7%" title="Descend to BMT level">
+          <span class="stop-dot"></span>
+          <span class="stop-label">BMT · 40 m</span>
+        </button>
+        <button class="elevator-stop" data-system="IND" data-depth="0.92" style="--d:91.7%" title="Descend to IND level">
+          <span class="stop-dot"></span>
+          <span class="stop-label">IND · 55 m</span>
+        </button>
+        <div class="elevator-thumb" id="elevator-thumb"></div>
+      </div>
+      <div class="elevator-cap static">−60 m</div>
     </div>
-    <div class="controls-panel">
-      <h3>Controls</h3>
-      <ul>
-        <li><strong>Left click + drag</strong> to rotate</li>
-        <li><strong>Right click + drag</strong> to pan</li>
-        <li><strong>Scroll</strong> to zoom</li>
-        <li><strong>Ctrl + drag</strong> to tilt/pitch</li>
-      </ul>
-      <button id="reset-view">Reset View</button>
-    </div>
+
+    <!-- Side panel -->
+    <aside class="side-panel" id="side-panel">
+      <div class="side-panel-header">
+        <div>
+          <h1>NYC Subway 3D</h1>
+          <p class="subtitle">Manhattan, below the streets</p>
+        </div>
+        <button id="panel-toggle" aria-label="Collapse panel">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M3 5l4 4 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="side-panel-body">
+        <section>
+          <h2>Routes — click a system to isolate it</h2>
+          <div id="route-legend"></div>
+        </section>
+
+        <section>
+          <h2>Navigate</h2>
+          <ul class="hints">
+            <li><strong>Drag</strong><span>rotate</span></li>
+            <li><strong>Right-drag</strong><span>pan</span></li>
+            <li><strong>Scroll</strong><span>zoom</span></li>
+          </ul>
+        </section>
+      </div>
+    </aside>
+
+    <button id="reset-view" class="reset-btn">Reset view</button>
   </div>
 
   <script src="app.js"></script>

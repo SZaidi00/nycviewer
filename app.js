@@ -1,7 +1,12 @@
 /**
  * NYC 3D Subway Viewer
- * Uses Mapbox GL JS for the base map + 3D buildings,
- * and Three.js as a custom layer for 3D subway tubes at depth.
+ *
+ * Two worlds, one elevator:
+ *  - Above ground: Mapbox GL JS base map with clean white 3D buildings.
+ *  - Below ground: a fully custom Three.js scene (own canvas, own camera)
+ *    with subway tubes at true negative depths, fog and glow.
+ * The depth elevator crossfades between them — no Mapbox/Three.js
+ * renderer interop, so depth testing just works.
  */
 
 // ============================
@@ -9,9 +14,10 @@
 // ============================
 
 const MANHATTAN_CENTER = [-73.985, 40.754]; // ~Times Square / Midtown
-const INITIAL_ZOOM = 13.2;
-const INITIAL_PITCH = 55;
-const INITIAL_BEARING = -15;
+const CITY_VIEW = { center: MANHATTAN_CENTER, zoom: 13.2, pitch: 55, bearing: -15 };
+
+const MAX_DISPLAY_DEPTH = 60; // meters — bottom of the elevator track
+const UNDERGROUND_BG = 0x0d1117;
 
 const ROUTE_CONFIG = {
   // IRT – oldest, generally shallower
@@ -53,9 +59,8 @@ const ROUTE_CONFIG = {
 };
 
 const TUBE_RADIUS = 15; // meters — exaggerated for visibility
-const STATION_RADIUS = 12; // meters — exaggerated for visibility
-const TUBE_RADIAL_SEGMENTS = 8; // cross-section detail
-const TUBE_TUBULAR_SEGMENTS = 2; // per original point
+const STATION_RADIUS = 14; // meters — exaggerated for visibility
+const TUBE_RADIAL_SEGMENTS = 10;
 
 // ============================
 // UTILITIES
@@ -69,6 +74,13 @@ function getRouteConfig(routeId) {
     if (ROUTE_CONFIG[char]) return ROUTE_CONFIG[char];
   }
   return { color: '#888888', depth: -35, system: 'UNKNOWN' };
+}
+
+// Short display label for a route id ("6X" -> "6", "GS"/"FS" -> "S", "SI" -> "SIR")
+function routeLabel(routeId) {
+  if (routeId === 'SI') return 'SIR';
+  if (routeId === 'GS' || routeId === 'FS') return 'S';
+  return routeId.replace(/X$/, '');
 }
 
 function lngLatToMeters(lngLat, centerLngLat) {
@@ -98,58 +110,87 @@ function isInManhattan(coords) {
 }
 
 // ============================
-// THREE.JS CUSTOM MAPBOX LAYER
+// UNDERGROUND SCENE (pure Three.js)
 // ============================
 
-class Subway3DLayer {
-  constructor(id, lineData, stationData) {
-    this.id = id;
-    this.type = 'custom';
-    this.renderingMode = '3d';
-    this.lineData = lineData;
-    this.stationData = stationData;
-  }
+class UndergroundScene {
+  constructor(canvas, lineData, stationData) {
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.setClearColor(UNDERGROUND_BG);
 
-  onAdd(map, gl) {
-    this.map = map;
-    this.center = MANHATTAN_CENTER;
-
-    // Three.js setup
     this.scene = new THREE.Scene();
-    this.camera = new THREE.Camera();
+    this.scene.fog = new THREE.Fog(UNDERGROUND_BG, 6000, 18000);
 
-    // Lighting
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
-    this.scene.add(ambientLight);
+    this.camera = new THREE.PerspectiveCamera(
+      55, window.innerWidth / window.innerHeight, 10, 80000
+    );
 
-    const dirLight = new THREE.DirectionalLight(0xffffff, 0.4);
-    dirLight.position.set(1, 1, 1);
+    this.controls = new THREE.OrbitControls(this.camera, canvas);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+    this.controls.minDistance = 400;
+    this.controls.maxDistance = 26000;
+    // Allow orbiting below street level — into the tunnels
+    this.controls.maxPolarAngle = Math.PI * 0.92;
+
+    // Lighting: bright ambient + soft directional; tubes also self-glow
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.35);
+    dirLight.position.set(1, 2, 1);
     this.scene.add(dirLight);
 
-    // Renderer using Mapbox's GL context
-    this.renderer = new THREE.WebGLRenderer({
-      canvas: map.getCanvas(),
-      context: gl,
-      antialias: true,
-    });
-    this.renderer.autoClear = false;
-    this.renderer.outputEncoding = THREE.sRGBEncoding;
+    // Reference: faint street grid + translucent slab at ground level (y = 0)
+    const grid = new THREE.GridHelper(26000, 52, 0x2b3546, 0x1a2230);
+    grid.position.y = 0;
+    this.scene.add(grid);
 
-    // Build geometries
-    this._buildSubwayTubes();
-    this._buildStationMarkers();
+    const slab = new THREE.Mesh(
+      new THREE.PlaneGeometry(26000, 26000),
+      new THREE.MeshBasicMaterial({
+        color: 0x11161f, transparent: true, opacity: 0.35, depthWrite: false,
+      })
+    );
+    slab.rotation.x = -Math.PI / 2;
+    slab.position.y = 4; // just above the grid to avoid z-fighting
+    this.scene.add(slab);
+
+    // Per-system groups so lines can be isolated
+    this.systemGroups = {};
+
+    this._buildSubwayTubes(lineData);
+    this._buildStationMarkers(stationData);
+
+    this.resetCamera();
+
+    window.addEventListener('resize', () => this._onResize());
   }
 
-  _buildSubwayTubes() {
-    const features = this.lineData.features || [];
+  _groupFor(system) {
+    if (!this.systemGroups[system]) {
+      const group = new THREE.Group();
+      this.systemGroups[system] = group;
+      this.scene.add(group);
+    }
+    return this.systemGroups[system];
+  }
+
+  // lng/lat -> Three.js position: X = east, Y = up (depth is negative), Z = south
+  _toScene(coord, depth) {
+    const offset = lngLatToMeters(coord, MANHATTAN_CENTER);
+    return new THREE.Vector3(offset.x, depth, -offset.z);
+  }
+
+  _buildSubwayTubes(lineData) {
+    const features = lineData.features || [];
     let builtCount = 0;
 
     features.forEach((feature) => {
       const props = feature.properties || {};
       const routeId = props.rt_symbol || props.route_id || '';
-      const geoColor = props.color || '';
       const config = getRouteConfig(routeId);
-      const color = geoColor || config.color;
+      const color = props.color || config.color;
       const depth = config.depth;
 
       const geometryType = feature.geometry?.type;
@@ -160,20 +201,13 @@ class Subway3DLayer {
 
       segments.forEach((segment) => {
         if (segment.length < 2) return;
-
-        // Skip segments that are entirely outside Manhattan
-        const anyInManhattan = segment.some((c) => isInManhattan(c));
-        if (!anyInManhattan) return;
+        if (!segment.some((c) => isInManhattan(c))) return;
 
         const points = segment.map((coord, i) => {
           const variation = Math.sin(i * 0.4 + (routeId.charCodeAt(0) || 0)) * 4;
-          const d = depth + variation;
-          const offset = lngLatToMeters(coord, this.center);
-          // Mapbox custom layer convention: X=east, Y=north, Z=up(altitude)
-          return new THREE.Vector3(offset.x, offset.z, d);
+          return this._toScene(coord, depth + variation);
         });
 
-        // Create smooth curve
         const curve = new THREE.CatmullRomCurve3(points);
         curve.curveType = 'catmullrom';
         curve.tension = 0.5;
@@ -188,102 +222,102 @@ class Subway3DLayer {
 
         const material = new THREE.MeshPhongMaterial({
           color: color,
-          transparent: true,
-          opacity: 0.92,
+          emissive: color,
+          emissiveIntensity: 0.35,
           shininess: 60,
         });
 
-        const mesh = new THREE.Mesh(tubeGeo, material);
-        this.scene.add(mesh);
+        this._groupFor(config.system).add(new THREE.Mesh(tubeGeo, material));
         builtCount++;
       });
     });
 
-    console.log(`[Subway3DLayer] Built ${builtCount} tube segments`);
+    console.log(`[Underground] Built ${builtCount} tube segments`);
   }
 
-  _buildStationMarkers() {
-    const features = this.stationData.features || [];
+  _buildStationMarkers(stationData) {
+    const features = stationData.features || [];
     const seen = new Set();
     let builtCount = 0;
 
     features.forEach((feature) => {
       const props = feature.properties || {};
       const routeId = props.rt_symbol || props.route_id || '';
-      const geoColor = props.color || '';
       const config = getRouteConfig(routeId);
-      const color = geoColor || config.color;
+      const color = props.color || config.color;
       const coords = feature.geometry?.coordinates;
-      if (!coords) return;
-
-      // Only render stations in Manhattan
-      if (!isInManhattan(coords)) return;
+      if (!coords || !isInManhattan(coords)) return;
 
       // Deduplicate by rounded coordinates (~11m precision)
       const key = `${coords[0].toFixed(4)},${coords[1].toFixed(4)}-${routeId}`;
       if (seen.has(key)) return;
       seen.add(key);
 
-      const variation = Math.sin(coords[0] * 10) * 3;
-      const depth = config.depth + variation;
-      const offset = lngLatToMeters(coords, this.center);
+      const depth = config.depth + Math.sin(coords[0] * 10) * 3;
 
-      const geometry = new THREE.SphereGeometry(STATION_RADIUS, 12, 12);
       const material = new THREE.MeshPhongMaterial({
         color: color,
-        transparent: true,
-        opacity: 0.95,
         emissive: color,
-        emissiveIntensity: 0.3,
+        emissiveIntensity: 0.6,
+        shininess: 80,
       });
 
-      const mesh = new THREE.Mesh(geometry, material);
-      // Mapbox custom layer convention: X=east, Y=north, Z=up(altitude)
-      mesh.position.set(offset.x, offset.z, depth);
-      this.scene.add(mesh);
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(STATION_RADIUS, 14, 14), material
+      );
+      mesh.position.copy(this._toScene(coords, depth));
+      this._groupFor(config.system).add(mesh);
       builtCount++;
     });
 
-    console.log(`[Subway3DLayer] Built ${builtCount} station markers`);
+    console.log(`[Underground] Built ${builtCount} station markers`);
   }
 
-  render(gl, matrix) {
-    const centerMerc = mapboxgl.MercatorCoordinate.fromLngLat(this.center, 0);
-    const scale = centerMerc.meterInMercatorCoordinateUnits();
+  // Dim every system except the selected one (null = show all)
+  isolateSystem(system) {
+    Object.entries(this.systemGroups).forEach(([sys, group]) => {
+      const active = !system || sys === system;
+      group.children.forEach((mesh) => {
+        const m = mesh.material;
+        m.transparent = !active;
+        m.opacity = active ? 1 : 0.06;
+        m.depthWrite = active;
+        m.needsUpdate = true;
+      });
+    });
+  }
 
-    // Build model matrix that converts local meters (X=east, Y=north, Z=up)
-    // into Mapbox Mercator coordinates.
-    const modelMatrix = new THREE.Matrix4().compose(
-      new THREE.Vector3(centerMerc.x, centerMerc.y, centerMerc.z),
-      new THREE.Quaternion(),
-      new THREE.Vector3(scale, -scale, scale)
-    );
+  resetCamera() {
+    this.camera.position.set(-2000, 4500, 7500);
+    this.controls.target.set(0, -35, 0);
+    this.controls.update();
+  }
 
-    // Mapbox's matrix transforms Mercator → clip space.
-    // camera.projectionMatrix = VP * M_model transforms local → clip space.
-    const m = new THREE.Matrix4().fromArray(matrix);
-    this.camera.projectionMatrix = m.multiply(modelMatrix);
+  _onResize() {
+    this.camera.aspect = window.innerWidth / window.innerHeight;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+  }
 
-    this.renderer.state.reset();
+  render() {
+    this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }
 }
 
 // ============================
-// MAP & UI SETUP
+// MAP SETUP (above-ground world)
 // ============================
 
 let map;
+let underground = null;
+let undergroundActive = false;
 
 function getToken() {
   const urlParams = new URLSearchParams(window.location.search);
   const urlToken = urlParams.get('token');
   if (urlToken) return urlToken;
-
-  const stored = localStorage.getItem('nycviewer_mapbox_token');
-  if (stored) return stored;
-
-  return null;
+  return localStorage.getItem('nycviewer_mapbox_token');
 }
 
 function saveToken(token) {
@@ -299,10 +333,10 @@ function initMap(token) {
   map = new mapboxgl.Map({
     container: 'map',
     style: 'mapbox://styles/mapbox/light-v11',
-    center: MANHATTAN_CENTER,
-    zoom: INITIAL_ZOOM,
-    pitch: INITIAL_PITCH,
-    bearing: INITIAL_BEARING,
+    center: CITY_VIEW.center,
+    zoom: CITY_VIEW.zoom,
+    pitch: CITY_VIEW.pitch,
+    bearing: CITY_VIEW.bearing,
     antialias: true,
     maxPitch: 85,
   });
@@ -319,26 +353,23 @@ function initMap(token) {
   });
 
   map.on('style.load', () => {
-    // Add 3D buildings in white
     add3DBuildings();
-    // Load subway data and add custom layer
     loadSubwayData();
   });
 
   document.getElementById('reset-view').addEventListener('click', () => {
-    map.flyTo({
-      center: MANHATTAN_CENTER,
-      zoom: INITIAL_ZOOM,
-      pitch: INITIAL_PITCH,
-      bearing: INITIAL_BEARING,
-      duration: 1500,
-    });
+    if (descendT < 0.5) {
+      map.flyTo({ ...CITY_VIEW, duration: 1500 });
+    } else if (underground) {
+      underground.resetCamera();
+    }
   });
 
-  document.getElementById('clear-token').addEventListener('click', () => {
-    localStorage.removeItem('nycviewer_mapbox_token');
-    location.reload();
+  document.getElementById('panel-toggle').addEventListener('click', () => {
+    document.getElementById('side-panel').classList.toggle('collapsed');
   });
+
+  initElevator();
 }
 
 function add3DBuildings() {
@@ -356,42 +387,31 @@ function add3DBuildings() {
     ) {
       try {
         map.setLayoutProperty(layer.id, 'visibility', 'none');
-        console.log('[Buildings] Hidden 2D layer:', layer.id);
       } catch (e) { /* ignore */ }
     }
   });
 
-  // Find all fill-extrusion layers that look like buildings
-  const buildingLayers = style.layers.filter((l) =>
-    l.type === 'fill-extrusion' &&
-    (l.id.includes('building') || l['source-layer'] === 'building')
-  );
-
-  if (buildingLayers.length > 0) {
-    buildingLayers.forEach((layer) => {
+  // Recolor any existing 3D building layers to clean white
+  style.layers
+    .filter((l) =>
+      l.type === 'fill-extrusion' &&
+      (l.id.includes('building') || l['source-layer'] === 'building'))
+    .forEach((layer) => {
       try {
         map.setPaintProperty(layer.id, 'fill-extrusion-color', '#ffffff');
         map.setPaintProperty(layer.id, 'fill-extrusion-opacity', 1.0);
         map.setPaintProperty(layer.id, 'fill-extrusion-vertical-gradient', true);
-        const currentHeight = map.getPaintProperty(layer.id, 'fill-extrusion-height');
-        if (currentHeight) {
-          map.setPaintProperty(layer.id, 'fill-extrusion-height', ['*', 1.1, currentHeight]);
-        }
-        console.log('[Buildings] Recolored layer:', layer.id);
+        const h = map.getPaintProperty(layer.id, 'fill-extrusion-height');
+        if (h) map.setPaintProperty(layer.id, 'fill-extrusion-height', ['*', 1.1, h]);
       } catch (e) {
         console.warn('[Buildings] Could not modify layer', layer.id, e.message);
       }
     });
-  }
 
-  // Always add a dedicated high-quality building layer from composite source
-  // (it will sit on top of any existing ones if they exist).
+  // Add a dedicated high-quality building layer from the composite source
   let insertBefore = null;
   for (const layer of style.layers) {
-    if (layer.type === 'symbol') {
-      insertBefore = layer.id;
-      break;
-    }
+    if (layer.type === 'symbol') { insertBefore = layer.id; break; }
   }
 
   try {
@@ -410,11 +430,8 @@ function add3DBuildings() {
         'fill-extrusion-vertical-gradient': true,
       },
     };
-    if (insertBefore) {
-      map.addLayer(newLayer, insertBefore);
-    } else {
-      map.addLayer(newLayer);
-    }
+    if (insertBefore) map.addLayer(newLayer, insertBefore);
+    else map.addLayer(newLayer);
     console.log('[Buildings] Added custom building layer');
   } catch (e) {
     console.warn('[Buildings] Could not add custom building layer:', e.message);
@@ -434,6 +451,10 @@ function add3DBuildings() {
     }
   });
 }
+
+// ============================
+// DATA LOADING & LEGEND
+// ============================
 
 async function loadSubwayData() {
   const loadingOverlay = document.getElementById('loading-overlay');
@@ -455,13 +476,15 @@ async function loadSubwayData() {
     console.log('[Data] Loaded', linesData.features?.length || 0, 'line features');
     console.log('[Data] Loaded', stationsData.features?.length || 0, 'station features');
 
-    // Add custom Three.js layer
-    map.addLayer(new Subway3DLayer('subway-3d', linesData, stationsData));
+    // Build the custom underground world
+    underground = new UndergroundScene(
+      document.getElementById('underground-canvas'), linesData, stationsData
+    );
+    applyDescend(descendT); // sync crossfade + visibility with current state
+    startRenderLoop();
 
-    // Build legend
     buildLegend(linesData, stationsData);
 
-    // Show UI
     loadingOverlay.classList.add('hidden');
     document.getElementById('ui-controls').classList.remove('hidden');
   } catch (err) {
@@ -470,7 +493,7 @@ async function loadSubwayData() {
     panel.innerHTML = `
       <p style="color:#EE352E;margin-bottom:12px;">Error loading subway data.</p>
       <p style="font-size:12px;color:#666;margin-bottom:12px;">${err.message}</p>
-      <button onclick="location.reload()" style="padding:10px 20px;background:#111;color:white;border:none;border-radius:8px;cursor:pointer;">Retry</button>
+      <button onclick="location.reload()">Retry</button>
     `;
   }
 }
@@ -478,8 +501,8 @@ async function loadSubwayData() {
 function buildLegend(linesData, stationsData) {
   const legend = document.getElementById('route-legend');
   const seen = new Set();
+  const groups = {}; // system -> [{ routeId, color }]
 
-  // Collect unique routes from both lines and stations
   const features = [
     ...(linesData.features || []),
     ...(stationsData.features || []),
@@ -491,12 +514,153 @@ function buildLegend(linesData, stationsData) {
     seen.add(routeId);
 
     const config = getRouteConfig(routeId);
-    const badge = document.createElement('span');
-    badge.className = 'route-badge';
-    badge.style.backgroundColor = config.color;
-    badge.textContent = routeId;
-    legend.appendChild(badge);
+    if (!groups[config.system]) groups[config.system] = [];
+    groups[config.system].push({ routeId, color: f.properties?.color || config.color });
   });
+
+  ['IRT', 'BMT', 'IND', 'SIR', 'UNKNOWN'].forEach((system) => {
+    const routes = groups[system];
+    if (!routes || routes.length === 0) return;
+
+    const group = document.createElement('div');
+    group.className = 'legend-group clickable';
+    group.dataset.system = system;
+    group.title = `Isolate ${system} lines`;
+
+    const label = document.createElement('span');
+    label.className = 'legend-system';
+    label.textContent = system;
+
+    const badges = document.createElement('div');
+    badges.className = 'legend-badges';
+
+    routes.forEach(({ routeId, color }) => {
+      const badge = document.createElement('span');
+      badge.className = 'route-badge';
+      badge.style.backgroundColor = color;
+      badge.textContent = routeLabel(routeId);
+      // Light-colored bullets (N/Q/R/W yellow, L gray) need dark text
+      if (['#FCCC0A', '#A7A9AC'].includes(color.toUpperCase())) {
+        badge.classList.add('needs-dark-text');
+      }
+      badges.appendChild(badge);
+    });
+
+    group.addEventListener('click', () => {
+      setIsolation(isolatedSystem === system ? null : system);
+    });
+
+    group.appendChild(label);
+    group.appendChild(badges);
+    legend.appendChild(group);
+  });
+}
+
+// ============================
+// DEPTH ELEVATOR & CROSSFADE
+// ============================
+
+let descendT = 0; // 0 = street level, 1 = deepest view
+let isolatedSystem = null;
+
+function applyDescend(t, { fly = false } = {}) {
+  descendT = t;
+  const blend = Math.min(t / 0.33, 1); // worlds fully crossfade over the first third
+
+  // Crossfade the two worlds
+  map.getContainer().style.opacity = 1 - blend;
+  const undergroundEl = document.getElementById('underground');
+  undergroundEl.style.opacity = blend;
+  undergroundActive = t > 0.02;
+  undergroundEl.style.pointerEvents = blend > 0.5 ? 'auto' : 'none';
+
+  // UI chrome theme + thumb position + level readout
+  document.getElementById('ui-controls').classList.toggle('underground', blend > 0.5);
+  document.getElementById('elevator-thumb').style.top = `${t * 100}%`;
+  document.getElementById('elevator-cap').textContent =
+    t < 0.02 ? 'Street level' : `−${Math.round(t * MAX_DISPLAY_DEPTH)} m`;
+
+  // Returning to the surface: fly back to the city vantage point
+  if (fly && t < 0.5) {
+    map.flyTo({ ...CITY_VIEW, duration: 1400 });
+  }
+}
+
+function setIsolation(system) {
+  isolatedSystem = system;
+  if (underground) underground.isolateSystem(system);
+
+  document.querySelectorAll('.legend-group[data-system]').forEach((g) => {
+    g.classList.toggle('dimmed', !!system && g.dataset.system !== system);
+  });
+  document.querySelectorAll('.elevator-stop').forEach((s) => {
+    s.classList.toggle('active', s.dataset.system === system);
+  });
+
+  // Isolating from street level takes you down
+  if (system && descendT < 0.34) applyDescend(1, { fly: true });
+}
+
+function hideDescendHint() {
+  const hint = document.getElementById('descend-hint');
+  if (hint) hint.classList.add('hidden');
+}
+
+function initElevator() {
+  const track = document.getElementById('elevator-track');
+  let dragging = false;
+  let moved = false;
+
+  const tFromEvent = (e) => {
+    const rect = track.getBoundingClientRect();
+    return Math.min(Math.max((e.clientY - rect.top) / rect.height, 0), 1);
+  };
+
+  track.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    moved = false;
+    track.classList.remove('snapping');
+    track.setPointerCapture(e.pointerId);
+    hideDescendHint();
+    applyDescend(tFromEvent(e));
+  });
+
+  track.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    moved = true;
+    applyDescend(tFromEvent(e));
+  });
+
+  const endDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    track.classList.add('snapping');
+    applyDescend(descendT < 0.25 ? 0 : 1, { fly: true });
+  };
+  track.addEventListener('pointerup', endDrag);
+  track.addEventListener('pointercancel', endDrag);
+
+  // Depth stops: jump to a system level and isolate it
+  document.querySelectorAll('.elevator-stop').forEach((stop) => {
+    stop.addEventListener('click', () => {
+      if (moved) return; // was a drag, not a tap
+      const system = stop.dataset.system;
+      const depth = parseFloat(stop.dataset.depth);
+      track.classList.add('snapping');
+      hideDescendHint();
+      applyDescend(Math.max(depth, 0.34), { fly: true });
+      setIsolation(isolatedSystem === system ? null : system);
+    });
+  });
+}
+
+// Render loop — only draws the underground scene while it's on screen
+function startRenderLoop() {
+  function animate() {
+    requestAnimationFrame(animate);
+    if (undergroundActive && underground) underground.render();
+  }
+  animate();
 }
 
 // ============================
